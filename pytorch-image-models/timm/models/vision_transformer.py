@@ -33,6 +33,9 @@ try:
 except ImportError:
     from typing_extensions import Literal
 
+import numpy as np
+import torch.optim as optim
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -43,7 +46,7 @@ from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCE
     OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
 from timm.layers import PatchEmbed, Mlp, DropPath, AttentionPoolLatent, RmsNorm, PatchDropout, SwiGLUPacked, \
     trunc_normal_, lecun_normal_, resample_patch_embed, resample_abs_pos_embed, use_fused_attn, \
-    get_act_layer, get_norm_layer, LayerType
+    get_act_layer, get_norm_layer, LayerType,  build_sincos2d_pos_embed
 from ._builder import build_model_with_cfg
 from ._manipulate import named_apply, checkpoint_seq, adapt_input_conv
 from ._registry import generate_default_cfgs, register_model, register_model_deprecations
@@ -420,13 +423,17 @@ class VisionTransformer(nn.Module):
             proj_drop_rate: float = 0.,
             attn_drop_rate: float = 0.,
             drop_path_rate: float = 0.,
-            weight_init: Literal['skip', 'jax', 'jax_nlhb', 'moco', ''] = '',
+            weight_init: Literal['skip', 'jax', 'jax_nlhb', 'moco', '', 'mimetic', 'impulse'] = '',
             fix_init: bool = False,
             embed_layer: Callable = PatchEmbed,
             norm_layer: Optional[LayerType] = None,
             act_layer: Optional[LayerType] = None,
             block_fn: Type[nn.Module] = Block,
             mlp_layer: Type[nn.Module] = Mlp,
+            sin_pe: bool = False,
+            pseudo_input1: Literal['P','U','G','A','B'] = 'P',
+            pseudo_input2: Literal['P','U','G','A','B'] = 'P',
+            init_once: bool = True,
     ) -> None:
         """
         Args:
@@ -492,7 +499,15 @@ class VisionTransformer(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if class_token else None
         self.reg_token = nn.Parameter(torch.zeros(1, reg_tokens, embed_dim)) if reg_tokens else None
         embed_len = num_patches if no_embed_class else num_patches + self.num_prefix_tokens
-        self.pos_embed = nn.Parameter(torch.randn(1, embed_len, embed_dim) * .02)
+        # change to absolute sinusoidal positional encoding
+        self.sin_pe = sin_pe
+        if sin_pe:
+            print('using abs pe')
+            self.pos_embed = build_sincos2d_pos_embed([img_size[0]//patch_size,img_size[1]//patch_size],dim=embed_dim,device='cuda')
+        else:
+            print('using default pe')
+            self.pos_embed = nn.Parameter(torch.randn(1, embed_len, embed_dim) * .02)
+
         self.pos_drop = nn.Dropout(p=pos_drop_rate)
         if patch_drop_rate > 0:
             self.patch_drop = PatchDropout(
@@ -537,7 +552,19 @@ class VisionTransformer(nn.Module):
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
         if weight_init != 'skip':
-            self.init_weights(weight_init)
+            if weight_init in ('jax', 'jax_nlhb', 'moco', ''):
+                print('init weights...')
+                self.init_weights(weight_init)
+            else:
+                self.weight_init = weight_init
+                self.depth = depth
+                self.num_heads = num_heads
+                self.attn_size = [(img_size[0]//patch_size),(img_size[1]//patch_size)]
+                self.embed_dim = embed_dim
+                self.pseudo_input1 = pseudo_input1
+                self.pseudo_input2 = pseudo_input2
+                self.init_once = init_once
+                self._init_weights(self)
         if fix_init:
             self.fix_init_weight()
 
@@ -552,14 +579,80 @@ class VisionTransformer(nn.Module):
     def init_weights(self, mode: str = '') -> None:
         assert mode in ('jax', 'jax_nlhb', 'moco', '')
         head_bias = -math.log(self.num_classes) if 'nlhb' in mode else 0.
-        trunc_normal_(self.pos_embed, std=.02)
+        # don't need trunc normal init when using sin pe
+        if not self.sin_pe:
+            print('using trunc pe initialization')
+            trunc_normal_(self.pos_embed, std=.02)
         if self.cls_token is not None:
             nn.init.normal_(self.cls_token, std=1e-6)
         named_apply(get_init_weights_vit(mode, head_bias), self)
 
     def _init_weights(self, m: nn.Module) -> None:
         # this fn left here for compat with downstream users
-        init_weights_vit_timm(m)
+        # init_weights_vit_timm(m)
+        # modified this funcition as our initialization
+        mode = self.weight_init
+        if 'mimetic' in mode:
+            alpha, beta = mode[7:].split('_')
+            alpha = float(alpha)
+            beta = float(beta)
+            print(f'using mimetic init with alpha={alpha}, beta={beta}')
+            head_dim = self.embed_dim // self.num_heads
+            for i in range(self.depth):
+                d = i / float(self.depth - 1)
+
+                for h in range(self.num_heads):
+                    Q, K = get_ortho_like(self.embed_dim, -float('inf'), alpha, beta, 1)
+                    Q = Q[:,:head_dim]
+                    K = K.T[:,:head_dim]
+
+                    self.blocks[i].attn.qkv.weight.data[(h*head_dim):((h+1)*head_dim)] = torch.tensor(Q.T).float()
+                    self.blocks[i].attn.qkv.weight.data[self.embed_dim+(h*head_dim):self.embed_dim+((h+1)*head_dim)] = torch.tensor(K.T).float()
+
+            for block in self.blocks:
+                V, Proj = get_ortho_like(self.embed_dim, self.num_heads, 0.4, 0.4, -1)
+                block.attn.qkv.weight.data[2*self.embed_dim:] = torch.tensor(V).float()
+                block.attn.proj.weight.data = torch.tensor(Proj).float()
+        elif 'impulse' in mode:
+            a = mode[7:]
+            # scale = float(a)
+            scale = (self.embed_dim // self.num_heads) ** -0.5
+            norm_epoch = 100 # int(b)
+            ff = int(a)
+            print(f'using impulse init with scale={scale}, norm_epoch={norm_epoch}, kernel size={ff}')
+            head_dim = self.embed_dim // self.num_heads
+
+            def get_pseudo_input(code,self):
+                if code == 'P':
+                    return self.pos_embed
+                elif code == 'U':
+                    return 2*torch.rand(self.pos_embed.shape,device=self.pos_embed.device)-1
+                elif code == 'G':
+                    return trunc_normal_(torch.zeros_like(self.pos_embed), std=torch.sqrt(torch.tensor(1/2)))
+                elif code == 'A':
+                    return self.pos_embed+2*torch.rand(self.pos_embed.shape,device=self.pos_embed.device)-1
+                elif code == 'B':
+                    return self.pos_embed+trunc_normal_(torch.zeros_like(self.pos_embed), std=torch.sqrt(torch.tensor(1/2)))
+                else:
+                    return None
+            
+            for i in range(self.depth):
+                d = i / float(self.depth - 1)
+                if i == 0:
+                    Q, K = impulse_init(self.num_heads,self.attn_size,head_dim,ff,scale=scale,spatial_pe=get_pseudo_input(self.pseudo_input1,self),norm=norm_epoch)
+                elif i == 1:
+                    if not self.pseudo_input1==self.pseudo_input2:
+                        Q, K = impulse_init(self.num_heads,self.attn_size,head_dim,ff,scale=scale,spatial_pe=get_pseudo_input(self.pseudo_input2,self),norm=norm_epoch)
+                    elif not self.init_once:
+                        Q, K = impulse_init(self.num_heads,self.attn_size,head_dim,ff,scale=scale,spatial_pe=get_pseudo_input(self.pseudo_input2,self),norm=norm_epoch)
+                else:
+                    if not self.init_once:
+                        Q, K = impulse_init(self.num_heads,self.attn_size,head_dim,ff,scale=scale,spatial_pe=get_pseudo_input(self.pseudo_input2,self),norm=norm_epoch)
+                for h in range(self.num_heads):
+                    self.blocks[i].attn.qkv.weight.data[(h*head_dim):((h+1)*head_dim)] = torch.tensor(Q[h].T).float()
+                    self.blocks[i].attn.qkv.weight.data[self.embed_dim+(h*head_dim):self.embed_dim+((h+1)*head_dim)] = torch.tensor(K[h]).float()
+
+
 
     @torch.jit.ignore()
     def load_pretrained(self, checkpoint_path: str, prefix: str = '') -> None:
@@ -760,6 +853,75 @@ def get_init_weights_vit(mode: str = 'jax', head_bias: float = 0.0) -> Callable:
         return init_weights_vit_moco
     else:
         return init_weights_vit_timm
+    
+def get_ortho_like(dim, heads, alpha, beta, sign=1, dist='uniform'):
+    if dist == 'normal':
+        A = alpha * np.random.normal(size=(dim,dim)) / (dim**0.5) + sign * beta * np.eye(dim)
+    if dist == 'uniform':
+        A = alpha * np.random.uniform(size=(dim,dim), low=-3**0.5 / (dim**0.5), high = 3**0.5 / (dim**0.5))\
+    + sign * beta * np.eye(dim)
+
+    U, S, V = np.linalg.svd(A)
+    L = U @ np.diag(np.sqrt(S))
+    R = np.diag(np.sqrt(S)) @ V
+    return L, R
+
+def impulse_init(heads,img_size,att_rank,ff,scale=1.0,spatial_pe=None,norm=1):
+    weight = torch.zeros((heads,img_size[0]*img_size[1],img_size[0]*img_size[1]))
+    k = torch.randint(0,ff**2,(heads,))
+    for i in range(heads):
+        m = (k[i]//ff)-(ff//2)
+        n = (k[i]%ff)-(ff//2)
+        tmp_weight = torch.zeros((img_size[1],img_size[1]))
+        for j in range(0-min(0,n),img_size[1]-max(0,n)):
+            tmp_weight[j,j+n] = 1
+        for j in range(0-min(0,m),img_size[0]-max(0,m)):
+            weight[i,j*img_size[1]:(j+1)*img_size[1],(j+m)*img_size[1]:(j+m+1)*img_size[1]] = tmp_weight
+    # weight = np.sqrt(1/3)*weight
+    class PermuteM(nn.Module):
+        def __init__(self, heads, att_size, att_rank,scale=1.0,spatial_pe=None):
+            super().__init__()
+            self.scale = scale
+            if spatial_pe is None:
+                self.spatial_pe = False
+                weights_Q = np.sqrt(1/att_rank/heads)*(2*torch.rand(heads,att_size,att_rank)-1)
+                weights_K = np.sqrt(1/att_rank/heads)*(2*torch.rand(heads,att_rank,att_size)-1)
+            else:
+                self.spatial_pe = True
+                self.pe = torch.nn.functional.layer_norm(spatial_pe.cuda(),[spatial_pe.shape[1]])
+                weights_Q = np.sqrt(1/att_rank/heads)*(2*torch.rand(heads,spatial_pe.shape[1],att_rank)-1)
+                weights_K = np.sqrt(1/att_rank/heads)*(2*torch.rand(heads, att_rank, spatial_pe.shape[1])-1)
+
+            self.weights_K = nn.Parameter(weights_K)
+            self.weights_Q = nn.Parameter(weights_Q)
+        def forward(self):
+            if self.spatial_pe:
+                M = self.pe@self.weights_Q@self.weights_K@(self.pe.T)
+            else:
+                M = torch.bmm(self.weights_Q,self.weights_K)
+            return torch.softmax(M*self.scale,-1)
+    
+    net = PermuteM(heads,img_size[0]*img_size[1],att_rank,scale,spatial_pe)
+    net.cuda()
+
+    nq = net.weights_Q.detach().cpu().norm(dim=(1)).mean()
+    weight = weight.cuda()
+    num_epoch = 10000
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(net.parameters(), lr=0.0001)#,weight_decay=1e-6)
+    for i in range(num_epoch):
+        if i%norm==0:
+            with torch.no_grad():
+                net.weights_Q.div_(net.weights_Q.detach().norm(dim=(1),keepdim=True)/nq)
+                net.weights_K.div_(net.weights_K.detach().norm(dim=(1),keepdim=True)/nq)
+        optimizer.zero_grad()
+        outputs = net()
+        loss = criterion(outputs, weight)
+        loss.backward()
+        optimizer.step()
+    print(loss.data)
+
+    return net.weights_Q.detach().cpu(),net.weights_K.detach().cpu()
 
 
 def resize_pos_embed(
@@ -1794,6 +1956,23 @@ def _create_vision_transformer(variant: str, pretrained: bool = False, **kwargs)
         **kwargs,
     )
 
+@register_model
+def vit_tiny_patch2_32_base(pretrained: bool = False, **kwargs) -> VisionTransformer:
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(img_size=[32,32], patch_size=2)
+    model = _create_vision_transformer('vit_tiny_patch2_32', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+
+@register_model
+def vit_tiny_patch2_32(pretrained: bool = False, **kwargs) -> VisionTransformer:
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(img_size=[32,32], patch_size=2, embed_dim=192, depth=12, num_heads=3)
+    model = _create_vision_transformer('vit_tiny_patch2_32', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
 
 @register_model
 def vit_tiny_patch16_224(pretrained: bool = False, **kwargs) -> VisionTransformer:

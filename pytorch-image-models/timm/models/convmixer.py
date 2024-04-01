@@ -4,6 +4,8 @@
 import torch
 import torch.nn as nn
 
+import numpy as np
+
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import SelectAdaptivePool2d
 from ._registry import register_model, generate_default_cfgs
@@ -11,6 +13,78 @@ from ._builder import build_model_with_cfg
 from ._manipulate import checkpoint_seq
 
 __all__ = ['ConvMixer']
+
+# initialization of convolusion kernel, C*1*K*K
+def SpatialConv2d_init(C, kernel_size, init='random'):
+    weight = None
+    if (init == 'random')|(init == 'softmax'):
+        weight = 1/kernel_size*(2*torch.rand((C,1,kernel_size,kernel_size))-1)
+    elif init == 'impulse':
+        k = torch.randint(0,kernel_size*kernel_size,(C,1))
+        weight = torch.zeros((C,1,kernel_size*kernel_size))
+        for i in range(C):
+            for j in range(1):
+                weight[i,j,k[i,j]] = 1
+        weight = np.sqrt(1/kernel_size)*weight.reshape(C,1,kernel_size,kernel_size)
+    elif init[:3] == 'box':
+        weight = torch.zeros((C,1,kernel_size*kernel_size))
+        for i in range(C):
+            for j in range(1):
+                k = np.random.choice(kernel_size*kernel_size,int(init[3:]),replace=False)
+                weight[i,j,k] = 1
+        weight = np.sqrt(1/int(init[3:])/kernel_size)*weight.reshape(C,1,kernel_size,kernel_size)
+    elif init[:3] == 'gau':
+        k = torch.randint(0,kernel_size,(C,1,2))
+        weight = torch.zeros((C,1,kernel_size,kernel_size))
+        for i in range(C):
+            for j in range(1):
+                for p in range(kernel_size):
+                    for q in range(kernel_size):
+                        weight[i,j,p,q] = (-0.5/float(init[3:])*((p-k[i,j,0])**2+(q-k[i,j,1])**2)).exp()
+        weight = weight/((weight.flatten(1,3)**2).sum(1).mean()*kernel_size).sqrt()
+    if weight is None:
+        return -1
+    else:
+        return weight
+
+
+# my spatial conv fuction, group=#channels, heads controls the number of different conv filters
+class SpatialConv2d(nn.Module):
+    def __init__(self, C, kernel_size, bias=True, init='random', num_heads = -1, trainable= True, input_weight=None):
+        super(SpatialConv2d, self).__init__()
+        self.C = C
+        self.kernel_size = kernel_size
+        self.init = init
+        
+        # different initialisation
+        weight = SpatialConv2d_init(C,kernel_size,init=init)
+        
+        # how many heads or different filters we want to use
+        if (num_heads<1)|(num_heads>C) :
+            num_heads = C
+        self.choice_idx = np.random.choice(num_heads,C,replace=(num_heads<C))
+
+        # if use gloabal weight
+        if input_weight is None:
+            self.weight = nn.Parameter(weight[:num_heads],requires_grad=trainable)
+        else:
+            self.weight = input_weight
+
+        if bias:
+            bias = 1/kernel_size*(2*torch.rand((C))-1)
+            self.bias = nn.Parameter(bias,requires_grad=trainable)
+        else:
+            self.bias = None
+
+
+    def forward(self, x):
+        if self.init == 'softmax':
+            w_s = self.weight.shape
+            return torch.nn.functional.conv2d(x, self.weight.flatten(2,3).softmax(-1).reshape(w_s)[self.choice_idx],self.bias,padding='same',groups=self.C)
+        else:
+            return torch.nn.functional.conv2d(x, self.weight[self.choice_idx], self.bias,padding='same',groups=self.C)
+
+
 
 
 class Residual(nn.Module):
@@ -34,6 +108,9 @@ class ConvMixer(nn.Module):
             global_pool='avg',
             drop_rate=0.,
             act_layer=nn.GELU,
+            init='random',
+            num_heads=0,
+            trainable=True,
             **kwargs,
     ):
         super().__init__()
@@ -49,7 +126,8 @@ class ConvMixer(nn.Module):
         self.blocks = nn.Sequential(
             *[nn.Sequential(
                     Residual(nn.Sequential(
-                        nn.Conv2d(dim, dim, kernel_size, groups=dim, padding="same"),
+                        # nn.Conv2d(dim, dim, kernel_size, groups=dim, padding="same"),
+                        SpatialConv2d(dim,kernel_size,init=init,num_heads=num_heads,trainable=trainable),
                         act_layer(),
                         nn.BatchNorm2d(dim)
                     )),
@@ -142,3 +220,70 @@ def convmixer_768_32(pretrained=False, **kwargs) -> ConvMixer:
 def convmixer_1024_20_ks9_p14(pretrained=False, **kwargs) -> ConvMixer:
     model_args = dict(dim=1024, depth=20, kernel_size=9, patch_size=14, **kwargs)
     return _create_convmixer('convmixer_1024_20_ks9_p14', pretrained, **model_args)
+
+
+
+# my small one for cifar
+
+@register_model
+def convmixer(pretrained=False, **kwargs) -> ConvMixer:
+    model_args = dict(**kwargs)
+    return _create_convmixer('convmixer', pretrained, **model_args)
+
+
+@register_model
+def convmixer_256_8_3_train(pretrained=False, **kwargs) -> ConvMixer:
+    model_args = dict(dim=256, depth=8, kernel_size=3, patch_size=2, **kwargs)
+    return _create_convmixer('convmixer_256_8_3_train', pretrained, **model_args)
+@register_model
+def convmixer_256_8_3_random(pretrained=False, **kwargs) -> ConvMixer:
+    model_args = dict(dim=256, depth=8, kernel_size=3, patch_size=2, trainable=False, **kwargs)
+    return _create_convmixer('convmixer_256_8_3_random', pretrained, **model_args)
+@register_model
+def convmixer_256_8_3_impulse(pretrained=False, **kwargs) -> ConvMixer:
+    model_args = dict(dim=256, depth=8, kernel_size=3, patch_size=2, init='box1', trainable=False, **kwargs)
+    return _create_convmixer('convmixer_256_8_3_impulse', pretrained, **model_args)
+@register_model
+def convmixer_256_8_3_box(pretrained=False, **kwargs) -> ConvMixer:
+    model_args = dict(dim=256, depth=8, kernel_size=3, patch_size=2, init='box9', trainable=False, **kwargs)
+    return _create_convmixer('convmixer_256_8_3_box', pretrained, **model_args)
+
+
+
+
+@register_model
+def convmixer_512_6_3_train(pretrained=False, **kwargs) -> ConvMixer:
+    model_args = dict(dim=512, depth=6, kernel_size=3, patch_size=2, **kwargs)
+    return _create_convmixer('convmixer_512_6_3_train', pretrained, **model_args)
+@register_model
+def convmixer_512_6_3_random(pretrained=False, **kwargs) -> ConvMixer:
+    model_args = dict(dim=512, depth=6, kernel_size=3, patch_size=2, trainable=False, **kwargs)
+    return _create_convmixer('convmixer_512_6_3_random', pretrained, **model_args)
+@register_model
+def convmixer_512_6_3_impulse(pretrained=False, **kwargs) -> ConvMixer:
+    model_args = dict(dim=512, depth=6, kernel_size=3, patch_size=2, init='box1', trainable=False, **kwargs)
+    return _create_convmixer('convmixer_512_6_3_impulse', pretrained, **model_args)
+@register_model
+def convmixer_512_6_3_box(pretrained=False, **kwargs) -> ConvMixer:
+    model_args = dict(dim=512, depth=6, kernel_size=3, patch_size=2, init='box9', trainable=False, **kwargs)
+    return _create_convmixer('convmixer_512_6_3_box', pretrained, **model_args)
+
+
+
+
+@register_model
+def convmixer_512_6_5_train(pretrained=False, **kwargs) -> ConvMixer:
+    model_args = dict(dim=512, depth=6, kernel_size=5, patch_size=2, **kwargs)
+    return _create_convmixer('convmixer_512_6_5_train', pretrained, **model_args)
+@register_model
+def convmixer_512_6_5_random(pretrained=False, **kwargs) -> ConvMixer:
+    model_args = dict(dim=512, depth=6, kernel_size=5, patch_size=2, trainable=False, **kwargs)
+    return _create_convmixer('convmixer_512_6_5_random', pretrained, **model_args)
+@register_model
+def convmixer_512_6_5_impulse(pretrained=False, **kwargs) -> ConvMixer:
+    model_args = dict(dim=512, depth=6, kernel_size=5, patch_size=2, init='box1', trainable=False, **kwargs)
+    return _create_convmixer('convmixer_512_6_5_impulse', pretrained, **model_args)
+@register_model
+def convmixer_512_6_5_box(pretrained=False, **kwargs) -> ConvMixer:
+    model_args = dict(dim=512, depth=6, kernel_size=5, patch_size=2, init='box25', trainable=False, **kwargs)
+    return _create_convmixer('convmixer_512_6_5_box', pretrained, **model_args)

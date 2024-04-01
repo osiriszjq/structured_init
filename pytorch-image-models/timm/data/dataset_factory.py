@@ -5,7 +5,7 @@ Hacked together by / Copyright 2021, Ross Wightman
 import os
 from typing import Optional
 
-from torchvision.datasets import CIFAR100, CIFAR10, MNIST, KMNIST, FashionMNIST, ImageFolder
+from torchvision.datasets import CIFAR100, CIFAR10, MNIST, KMNIST, SVHN, FashionMNIST, ImageFolder
 try:
     from torchvision.datasets import Places365
     has_places365 = True
@@ -36,6 +36,12 @@ _TORCH_BASIC_DS = dict(
     kmnist=KMNIST,
     fashion_mnist=FashionMNIST,
 )
+
+_TORCH_ADV_DS = dict(
+    svhn=SVHN,
+)
+
+
 _TRAIN_SYNONYM = dict(train=None, training=None)
 _EVAL_SYNONYM = dict(val=None, valid=None, validation=None, eval=None, evaluation=None)
 
@@ -112,9 +118,17 @@ def create_dataset(
         name = name.split('/', 2)[-1]
         torch_kwargs = dict(root=root, download=download, **kwargs)
         if name in _TORCH_BASIC_DS:
+            print('known torch dataset')
             ds_class = _TORCH_BASIC_DS[name]
             use_train = split in _TRAIN_SYNONYM
             ds = ds_class(train=use_train, **torch_kwargs)
+        elif name in _TORCH_ADV_DS:
+            print('known torch dataset')
+            ds_class = _TORCH_ADV_DS[name]
+            if split in _TRAIN_SYNONYM:
+                ds = ds_class(split='train', **torch_kwargs)
+            else:
+                ds = ds_class(split='test', **torch_kwargs)
         elif name == 'inaturalist' or name == 'inat':
             assert has_inaturalist, 'Please update to PyTorch 1.10, torchvision 0.11+ for Inaturalist'
             target_type = 'full'
