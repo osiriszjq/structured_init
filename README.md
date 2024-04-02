@@ -12,14 +12,14 @@ We added our structured initialization in `vision_transformer.py`. We trained Tr
 Inside `pytorch-image-models`, we have made the following modifications, which can also be found in [this commit](https://github.com/osiriszjq/structured_init/commit/9c2d0e0d10ce491e720533e24a56aa2063e40211)
 
 - Added our structured initialization to `timm/models/vision_transformer.py`
-- Added other initializaiton to `timm/models/convmixer.py`
+- Added other initializaitons to `timm/models/convmixer.py`
 - Modified other supporting files
   - added `SVHN` dataset in `timm/data/dataset_factory.py`
   - added `SyntaxError` in `timm/utils/misc.py`
 
 
 ## Training
-The ViT models are just trained in a normal way. However, you may need to specify which initialization stragy you want to use. Our structured initialization can **only** work with *global pooling* instead of *cls token*:
+The ViT models are just trained in a normal way. However, you may need to specify which initialization strategy you want to use. Our structured initialization can **only** work with *global pooling* instead of *cls token*:
 
 ### Small Dataset
 
