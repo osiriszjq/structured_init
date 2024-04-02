@@ -81,7 +81,7 @@ sh distributed_train.sh 8 [/path/to/your/ImageNet-1k]
     --warmup-epochs 50
 ```
 
-You can replace `[initialization/method]` with ``, `skip`, `mimetic0.7_0.7`, `impulse3` or `impulse5`.
+You can replace `[initialization/method]` with ` `, `skip`, `mimetic0.7_0.7`, `impulse3` or `impulse5`.
 
 ## Citation
 ```
